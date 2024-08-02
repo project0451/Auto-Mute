@@ -6,6 +6,7 @@
 // Standard C++ header files
 //#include <stdio.h>
 #include <iostream>
+#include <unordered_map>
 //#include <conio.h>
 
 // Header file for Windows
@@ -40,10 +41,13 @@ using namespace std;
 
 #define LOGGING true
 #define COM_AUDIO_ACTIVE true
+#define AUDCLNT_S_NO_SINGLE_PROCESS AUDCLNT_SUCCESS (0x00d)
 
 // Declare and initialize globals
 LPCTSTR sessionThreadEventName = (LPCTSTR) "AudioSessionTrackingThreadReadyEvent";
 LPCTSTR processingThreadEventName = (LPCTSTR) "EventProcessingThreadReadyEvent";
+DWORD oldProcessId = 0;
+unordered_multimap<DWORD,IAudioSessionControl2 *> sessionsList;
 
 //
 
@@ -127,8 +131,9 @@ HRESULT GetIAudioSessionManager2(IAudioSessionManager2 ** ppSessionManager)
 }
 
 // Add an audio session to the programs internal tracker
-// For the moment, this is a placeholder which just prints some
-// information about the session
+// Prints information about the session and adds it to session list
+// This method will increase the ref count to pSession if it succeeds
+// Caller should release pSession when caller is done with it
 HRESULT AddAudioSession(IAudioSessionControl2 * pSession)
 {
   if(!pSession)
@@ -139,6 +144,7 @@ HRESULT AddAudioSession(IAudioSessionControl2 * pSession)
     return E_POINTER;
   }
   HRESULT hr = S_OK;
+  DWORD sessionProcessId;
   LPWSTR pswDisplayName = NULL;
   LPWSTR pswSessionID = NULL;
   LPWSTR pswSessionInstance = NULL;
@@ -169,94 +175,109 @@ HRESULT AddAudioSession(IAudioSessionControl2 * pSession)
     CoTaskMemFree(pswSessionID);
     return hr;
   }
-  printf("Is this a double print, or is the callback firing twice?");
-  printf("Audio Session found. Name: %ls, Identifier: %ls, Instance: %ls\n", pswDisplayName, pswSessionID, pswSessionInstance);
+
+  hr = pSession -> GetProcessId(*sessionProcessId);
+  if(hr != S_OK && hr != AUDCLNT_S_NO_SINGLE_PROCESS)
+  {
+    #if LOGGING
+    printf("ERROR: GetProcessId failed with error code: %ld\n", hr);
+    #endif
+    return hr;
+  }
+  printf("Audio Session found. Process: %ld, Name: %ls, Identifier: %ls, Instance: %ls\n", sessionProcessId, pswDisplayName, pswSessionID, pswSessionInstance);
   CoTaskMemFree(pswDisplayName);
   CoTaskMemFree(pswSessionID);
   CoTaskMemFree(pswSessionInstance);
+
+  if(hr == AUDCLNT_S_NO_SINGLE_PROCESS)
+  {
+    // Special handling for cross-process session
+    printf("This session is a cross-process audio session.\n");
+  }
+
+  sessionList.insert(std::make_pair<DWORD,IAudioSessionControl2 *>(sessionProcessId,pSession));
+  pSession -> AddRef();
+
+  // TO DO - Register for session events with pSession -> RegisterAudioSessionNotification()
+
   return hr;
 }
 
 // Callback for new audio session creation
 // Mostly copied from Microsoft Learn IAudioSessionNotification example
-// Only the contents of OnSessionCreated have been modified
+// The contents of OnSessionCreated have been modified, and errors in the definition fixed
 class CSessionNotifier: public IAudioSessionNotification
 {
 private:
 
-    LONG             m_cRefAll;
+    LONG m_cRefAll;
     HWND m_hwndMain;
 
 //    ~CSessionNotifier(){};
 
 public:
 
-
     CSessionNotifier(HWND hWnd): 
-    m_cRefAll(1),
-    m_hwndMain (hWnd)
-
+      m_cRefAll(1),
+      m_hwndMain (hWnd)
     {}
 
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvInterface)  
     {    
-        if (IID_IUnknown == riid)
-        {
-            AddRef();
-            *ppvInterface = (IUnknown*)this;
-        }
-        else if (__uuidof(IAudioSessionNotification) == riid)
-        {
-            AddRef();
-            *ppvInterface = (IAudioSessionNotification*)this;
-        }
-        else
-        {
-            *ppvInterface = NULL;
-            return E_NOINTERFACE;
-        }
-        return S_OK;
+      if (IID_IUnknown == riid)
+      {
+        AddRef();
+        *ppvInterface = (IUnknown*)this;
+      }
+      else if (__uuidof(IAudioSessionNotification) == riid)
+      {
+        AddRef();
+        *ppvInterface = (IAudioSessionNotification*)this;
+      }
+      else
+      {
+        *ppvInterface = NULL;
+        return E_NOINTERFACE;
+      }
+      return S_OK;
     }
     
     ULONG STDMETHODCALLTYPE AddRef()
     {
-        return InterlockedIncrement(&m_cRefAll);
+      return InterlockedIncrement(&m_cRefAll);
     }
      
     ULONG STDMETHODCALLTYPE Release()
     {
-        ULONG ulRef = InterlockedDecrement(&m_cRefAll);
-        if (0 == ulRef)
-        {
-            delete this;
-        }
-        return ulRef;
+      ULONG ulRef = InterlockedDecrement(&m_cRefAll);
+      if (0 == ulRef)
+      {
+        delete this;
+      }
+      return ulRef;
     }
 
     HRESULT OnSessionCreated(IAudioSessionControl *pNewSession)
     {
-        if (pNewSession)
-        {
-//            PostMessage(m_hwndMain, WM_SESSION_CREATED, 0, 0);
-            IAudioSessionControl2 * pCtrl2 = NULL;
-            HRESULT hr = S_OK;
-            hr = pNewSession -> QueryInterface<IAudioSessionControl2>(&pCtrl2);
-            if(hr != S_OK)
-            {
-              #if LOGGING
-              printf("ERROR: QueryInterface for IAudioSessionControl2 failed with error code: %ld\n", hr);
-              #endif
-              return hr;
-            }
-            hr = AddAudioSession(pCtrl2);
-            pCtrl2 -> Release(); // Remove this line once AddSession actually adds to a list of sessions!
-            return hr;
-        }
-        else
-        {
-          return E_POINTER;
-        }
+      if (!pNewSession)
+      {
+        return E_POINTER;
+      }
+      // PostMessage(m_hwndMain, WM_SESSION_CREATED, 0, 0);
+      IAudioSessionControl2 * pCtrl2 = NULL;
+      HRESULT hr = S_OK;
+      hr = pNewSession -> QueryInterface<IAudioSessionControl2>(&pCtrl2);
+      if(hr != S_OK)
+      {
+        #if LOGGING
+        printf("ERROR: QueryInterface for IAudioSessionControl2 failed with error code: %ld\n", hr);
+        #endif
+        return hr;
+      }
+      hr = AddAudioSession(pCtrl2);
+      pCtrl2 -> Release();
+      return hr;
     }
 };
 
@@ -348,22 +369,23 @@ DWORD WINAPI AudioThreadRoutine(_In_ LPVOID pList)
   {
     hr = pEnum -> GetSession(i, &pCtrl);
     if(hr != S_OK) { break; }
+
     hr = pCtrl -> QueryInterface<IAudioSessionControl2>(&pCtrl2);
     pCtrl -> Release();
-    if(hr != S_OK) {break;}
+    if(hr != S_OK) { break; }
     
     hr = AddAudioSession(pCtrl2);
-
     pCtrl2 -> Release();
+    if(hr != S_OK && hr != AUDCLNT_S_NO_SINGLE_PROCESS) { break; }
   }
   pEnum -> Release();
 
-  if(hr != S_OK)
+  if(hr != S_OK && hr != AUDCLNT_S_NO_SINGLE_PROCESS)
   {
     #if LOGGING
     printf("ERROR: Problem in enumeration loop, error code: %ld\n", hr);
     #endif
-//    pMgr -> UnRegisterSessionNotification
+    pMgr -> UnRegisterSessionNotification(pCallback);
     pMgr -> Release();
     CoUninitialize();
     return 7;
@@ -381,11 +403,18 @@ DWORD WINAPI AudioThreadRoutine(_In_ LPVOID pList)
 
   pMgr -> UnregisterSessionNotification(pCallback);
   pMgr -> Release();
+
+  for(auto p : sessionList)
+  {
+    // TO DO - unregister notification with p.second -> UnregisterAudioSessionNotification();
+    p.second -> Release();
+    p.second = NULL;
+  }
+
   CoUninitialize();
   CloseHandle(hEvent);
   return (DWORD) hr;
 }
-
 
 
 // Event procssing thread routine
@@ -422,7 +451,11 @@ void CALLBACK WinEventProc(
     // Original payload, remove when no longer needed
 //    PlaySound(TEXT("C:\\Windows\\Media\\Speech Misrecognition.wav"), NULL, SND_FILENAME | SND_ASYNC);
     printf("Focus change, window of process %ld thread %ld now has focus.\n", switchedProcessId, switchedThreadId);
-//    cout << "Focus change, window of prodess " << switchedProcessId << " thread " << switchedThreadId << " now has focus." << endl;
+    if(switchedProcessId == oldProcessId) { return; }
+
+    // TO DO - Post Thread pool timer task to run MuteRoutine(switchedProcessId, oldProcessId)
+
+    oldProcessId = switchedProcessId; // Set new process as the new "old" process for the next focus change
   }
 }
 
@@ -458,14 +491,6 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
     return 2;
   }
 
-
-  // Set the event hook for the callback function
-  HWINEVENTHOOK hWinEventHook = SetWinEventHook(
-     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
-     NULL, WinEventProc, 0, 0,
-     WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-
-
   // Wait for other threads to finish setup. Mostly for debug purposes
   HANDLE hAudioThreadState[2] = {hAudioThreadEvent, hAudioThread};
   DWORD result = WaitForMultipleObjects(2, hAudioThreadState, false, 20000);
@@ -476,6 +501,13 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
     #endif
     return 3;
   }
+
+  // Set the event hook for the callback function
+  HWINEVENTHOOK hWinEventHook = SetWinEventHook(
+     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+     NULL, WinEventProc, 0, 0,
+     WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
 
   // Message loop, runs continuously until WM_QUIT or something goes wrong
   // GetMessage returns a "true" value normally, or a "0" on a WM_QUIT message...
@@ -488,9 +520,9 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
     TranslateMessage(&msg);
     DispatchMessage(&msg);
   }
-  // Remove the event hook, if it was actually set
-  SetEvent(hAudioThreadEvent);
+
   if (hWinEventHook) UnhookWinEvent(hWinEventHook);
+  SetEvent(hAudioThreadEvent);
 
   // End event procesing thread
   return 0;
