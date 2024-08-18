@@ -417,6 +417,30 @@ DWORD WINAPI AudioThreadRoutine(_In_ LPVOID pList)
 }
 
 
+void CALLBACK MuteRoutine( ... )
+{
+  int[2] processes = (int[2]) *pv;
+  int oldProc = processes[0];
+  omt newProc = processes[1];
+  ISimpleAudioVolume* pVol;
+  if(sessionList.contains(oldproc))
+  {
+    for(auto p: sessionsList.equal_range(oldProc))
+    {
+      p.second -> QueryInterface(ISimpleAudioVolume, &pVol);
+      if(pVol) { pVol -> setMute(true); pVol -> Release(); }
+    }
+  }
+  if(sessionList.contains(newProc))
+  {
+    for(auto p: sessionsList.equal_range(newProc))
+    {
+      p.second -> QueryInterface(ISimpleAudioVolume, &pVol);
+      if(pVol) { pVol -> SetMute(false); pVol -> Release(); }
+    }
+  }
+}
+
 // Event procssing thread routine
 // Runs in a loop and receives event reports fromthe callback in the main thread
 
@@ -454,6 +478,9 @@ void CALLBACK WinEventProc(
     if(switchedProcessId == oldProcessId) { return; }
 
     // TO DO - Post Thread pool timer task to run MuteRoutine(switchedProcessId, oldProcessId)
+    int[2] processes = {oldprocessId, switchedProcessId};
+
+    TrySubmitThreadpoolCallback(MuteRoutine, (void*) &processes, NULL);
 
     oldProcessId = switchedProcessId; // Set new process as the new "old" process for the next focus change
   }
