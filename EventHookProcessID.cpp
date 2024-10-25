@@ -49,7 +49,8 @@ LPCTSTR processingThreadEventName = (LPCTSTR) "EventProcessingThreadReadyEvent";
 DWORD oldProcessId = 0;
 unordered_multimap<DWORD,IAudioSessionControl2 *> sessionsList;
 CRITICAL_SECTION hashmapCriticalSection;
-
+unordered_set(LPWSTR) sessionIdSet;
+SYNCHRONIZATION_BARRIER syncBarrier;
 //
 
 // GetIAudioSessionManager2
@@ -149,6 +150,7 @@ HRESULT AddAudioSession(IAudioSessionControl2 * pSession, IAudioSessionEvents * 
   LPWSTR pswDisplayName = NULL;
   LPWSTR pswSessionID = NULL;
   LPWSTR pswSessionInstance = NULL;
+  LPWSTR pswFullSessionID = NULL;
   hr = pSession -> GetDisplayName(&pswDisplayName);
   if(hr != S_OK)
   {
@@ -186,9 +188,23 @@ HRESULT AddAudioSession(IAudioSessionControl2 * pSession, IAudioSessionEvents * 
     return hr;
   }
   printf("Audio Session found. Process: %ld, Name: %ls, Identifier: %ls, Instance: %ls\n", sessionProcessId, pswDisplayName, pswSessionID, pswSessionInstance);
+  pswFullSessionID = (LPWSTR) sessionProcessId;
+  pswFullSessionID = pswFullSessionID + "!" + pswSessionID + "!" pswSessionInstance;
+
   CoTaskMemFree(pswDisplayName);
   CoTaskMemFree(pswSessionID);
   CoTaskMemFree(pswSessionInstance);
+
+  if SessionIdSet.contains(pswFullSessionId)
+  {
+    printf("This session is a duplicate");
+    CoTaskMemFree(pswFullSessionId);
+    return S_OK;
+  }
+
+  sessionIdSet.insert(pswFullSessionID);
+
+  CoTaskMemFree(pswFullSessionID);
 
   if(hr == AUDCLNT_S_NO_SINGLE_PROCESS)
   {
@@ -450,7 +466,14 @@ public:
         }
         printf("Audio session disconnected (reason: %s)\n",
                pszReason);
-
+        
+        // Remoove this session from sessionsList hashmap and sessionIdSet
+        // Problem - OnSessionDisconnected does not give a context pointer...
+        // Do I need to add a pointer to the session to the constructor for
+        // this class, and construct a separate instance for eadh session and
+        // keep a big hashmap of each sessions full ID and assoiated instance
+        // of this class?
+        
         return S_OK;
     }
 };
@@ -568,13 +591,20 @@ DWORD WINAPI AudioThreadRoutine(_In_ LPVOID pList)
   }
 
   // Notify the main thread that we are initialized and ready to go
+  // Replace with a synchronization barrier
   SetEvent(hEvent);
+
 
   // Make sure the main thread has resumed and reset the event
   // This is ugly and theoretically unreliable, replace with something better
   Sleep(1000);
 
+
   // All done. Go to sleep and wait for end of program
+  // will replace this with a loop to wait for multiple objects
+  // if the triggering object was the queue, then pop the first
+  // item, extract oldProc and newProc and switch mute states
+  // if the triggering object is the quti event, then break
   WaitForSingleObject(hEvent, INFINITE);
 
   pMgr -> UnregisterSessionNotification(pCallback);
@@ -647,12 +677,11 @@ void CALLBACK WinEventProc(
     DWORD switchedProcessId;
     DWORD switchedThreadId = GetWindowThreadProcessId(hwnd, &switchedProcessId);
 
-    // Original payload, remove when no longer needed
-//    PlaySound(TEXT("C:\\Windows\\Media\\Speech Misrecognition.wav"), NULL, SND_FILENAME | SND_ASYNC);
     printf("Focus change, window of process %ld thread %ld now has focus.\n", switchedProcessId, switchedThreadId);
-    if(switchedProcessId == oldProcessId) { return; }
+    if(switchedProcessId == oldProcessId) { return; }    
 
-    SwitchMuteStates(oldProcessId, switchedProcessId);
+//    Send to queue for second thread (mute, oldProcessId, newProcessId)
+//    SwitchMuteStates(oldProcessId, switchedProcessId);
 
     oldProcessId = switchedProcessId; // Set new process as the new "old" process for the next focus change
   }
@@ -666,8 +695,6 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
                    LPSTR lpCmdLine, int nShowCmd)
 {
 
-//  cout << "This is a test of console output." << endl;
-
   setvbuf(stdout, NULL, _IONBF, 0);
   HANDLE hAudioThreadEvent = CreateEvent(NULL, false, false, sessionThreadEventName);
   if(!hAudioThreadEvent)
@@ -678,8 +705,6 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
     return 1;
   }
  
-  // Start event processing thread here, once implemented
-  
   // Start audio session tracking thread
   HANDLE hAudioThread = CreateThread(NULL, 0, AudioThreadRoutine, NULL, 0, NULL);
   if(!hAudioThread)
@@ -690,7 +715,8 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
     return 2;
   }
 
-  // Wait for other threads to finish setup. Mostly for debug purposes
+  // Wait for other threads to finish setup.
+  // Wait for the thread itself as well as the ready event, in case the thread aborts
   HANDLE hAudioThreadState[2] = {hAudioThreadEvent, hAudioThread};
   DWORD result = WaitForMultipleObjects(2, hAudioThreadState, false, 20000);
   if(result != WAIT_OBJECT_0)
@@ -711,8 +737,6 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
   // Message loop, runs continuously until WM_QUIT or something goes wrong
   // GetMessage returns a "true" value normally, or a "0" on a WM_QUIT message...
   // ...or a "-1" (say WHAT, now?!) if some kind of error happens.
-  // NOTE: Safer version which doesn't derail if GetMessage returns -1.
-  // Doesn't attempt any special error handling, just aborts and cleans up.
   MSG msg;
   int b;
   while ((b = GetMessage(&msg, NULL, 0, 0)) && b != -1) {
