@@ -27,8 +27,8 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <audiopolicy.h>
-//#include <ppl.h>
-//#include <concurrent_queue.h>
+#include <ppl.h>
+#include <concurrent_queue.h>
 
 
 //#define AUDCLNT_S_NO_SINGLE_PROCESS AUDCLNT_SUCCESS (0x00d)
