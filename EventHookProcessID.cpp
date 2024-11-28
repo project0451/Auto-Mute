@@ -6,6 +6,7 @@
 // Standard C++ header files
 //#include <stdio.h>
 #include <iostream>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 //#include <conio.h>
@@ -195,14 +196,14 @@ HRESULT AddAudioSession(IAudioSessionControl2 * pSession, IAudioSessionEvents * 
     return hr;
   }
   printf("Audio Session found. Process: %ld, Name: %ls, Identifier: %ls, Instance: %ls\n", sessionProcessId, pswDisplayName, pswSessionId, pswSessionInstance);
-  pswFullSessionId = (LPWSTR) sessionProcessId;
-  pswFullSessionId = pswFullSessionId + "!" + pswSessionId + "!" + pswSessionInstance;
+ // wstring swFullSessionId = std::to_wstring(sessionProcessId).append((wstring) "!").append(*pswSessionId).append((wstring) "!").append(*pswSessionInstance);
+//  pswFullSessionId = (LPWSTR) swFullSessionId;
 
   CoTaskMemFree(pswDisplayName);
   CoTaskMemFree(pswSessionId);
   CoTaskMemFree(pswSessionInstance);
 
-  if(sessionIdSet.contains(pswFullSessionId))
+  if(sessionIdSet.count(pswFullSessionId))
   {
     printf("This session is a duplicate.");
     CoTaskMemFree(pswFullSessionId);
@@ -229,7 +230,7 @@ HRESULT AddAudioSession(IAudioSessionControl2 * pSession, IAudioSessionEvents * 
   }
 
   EnterCriticalSection(&hashmapCriticalSection);
-  sessionsList.insert(std::make_pair<DWORD,IAudioSessionControl2 *>(sessionProcessId,pSession));
+  sessionsList.insert(make_pair(sessionProcessId, pSession));
   pSession -> AddRef();
   LeaveCriticalSection(&hashmapCriticalSection);
 
@@ -485,6 +486,31 @@ public:
     }
 };
 
+void SwitchMuteStates(DWORD oldProc, DWORD newProc)
+{
+  ISimpleAudioVolume* pVol;
+  EnterCriticalSection(&hashmapCriticalSection);
+  if(sessionsList.count(oldProc))
+  {
+    auto sessions = sessionsList.equal_range(oldProc);
+    for(auto p = sessions.first; p != sessions.second; ++p)
+    {
+      p -> second -> QueryInterface<ISimpleAudioVolume>(&pVol);
+      if(pVol) { pVol -> SetMute(true, NULL); pVol -> Release(); }
+    }
+  }
+  if(sessionsList.count(newProc))
+  {
+    auto sessions = sessionsList.equal_range(newProc);
+    for(auto p = sessions.first; p != sessions.second; ++p)
+    {
+      p -> second -> QueryInterface<ISimpleAudioVolume>(&pVol);
+      if(pVol) { pVol -> SetMute(false, NULL); pVol -> Release(); }
+    }
+  }
+  LeaveCriticalSection(&hashmapCriticalSection);
+}
+
 // Audio Session monitoring thread
 // Populates the list of all active audio sessions and registers a callbback to add
 // any new sessions created while the program is running
@@ -620,29 +646,6 @@ DWORD WINAPI AudioThreadRoutine(_In_ LPVOID pList)
 
   CoUninitialize();
   return (DWORD) hr;
-}
-
-void SwitchMuteStates(DWORD oldProc, DWORD newProc)
-{
-  ISimpleAudioVolume* pVol;
-  EnterCriticalSection(&hashmapCriticalSection);
-  if(sessionsList.contains(oldProc))
-  {
-    for(auto p: sessionsList.equal_range(oldProc))
-    {
-      p.second -> QueryInterface(ISimpleAudioVolume, &pVol);
-      if(pVol) { pVol -> setMute(true); pVol -> Release(); }
-    }
-  }
-  if(sessionList.contains(newProc))
-  {
-    for(auto p: sessionsList.equal_range(newProc))
-    {
-      p.second -> QueryInterface(ISimpleAudioVolume, &pVol);
-      if(pVol) { pVol -> SetMute(false); pVol -> Release(); }
-    }
-  }
-  LeaveCriticalSection(&hashmapCriticalSection);
 }
 
 // Event procssing thread routine
