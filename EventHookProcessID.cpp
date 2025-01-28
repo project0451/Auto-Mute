@@ -6,7 +6,9 @@
 // Standard C++ header files
 //#include <stdio.h>
 #include <iostream>
+#include <utility>
 #include <unordered_map>
+#include <unordered_set>
 //#include <conio.h>
 
 // Header file for Windows
@@ -19,18 +21,20 @@
 // For now, just include everything and worry about optimizing later
 #include <windows.h>
 // Header file for multimedia system, needed for PlaySound if pruning windows.h
- #include <mmsystem.h>
+#include <mmsystem.h>
 //#include <combaseapi.h>
 #include <objbase.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <audiopolicy.h>
 
+#include <queue>
+
 //#define AUDCLNT_S_NO_SINGLE_PROCESS AUDCLNT_SUCCESS (0x00d)
 
 // Remind the compiler to remind the linker to actually link the Windows libraries
 #pragma comment(lib, "user32.lib")
-// Needed for mecia APIs like PlaySound
+// Needed for media APIs like PlaySound
 #pragma comment(lib, "winmm.lib")
 // Needed for system time API
 #pragma comment(lib, "kernel32.lib")
@@ -44,12 +48,17 @@ using namespace std;
 #define AUDCLNT_S_NO_SINGLE_PROCESS AUDCLNT_SUCCESS (0x00d)
 
 // Declare and initialize globals
-LPCTSTR sessionThreadEventName = (LPCTSTR) "AudioSessionTrackingThreadReadyEvent";
-LPCTSTR processingThreadEventName = (LPCTSTR) "EventProcessingThreadReadyEvent";
+HANDLE ghEvents[2];
+LPCSTR workEventName = (LPCSTR) "workToDo";
+LPCSTR quitEventName = (LPCSTR) "quitEvent";
 DWORD oldProcessId = 0;
 unordered_multimap<DWORD,IAudioSessionControl2 *> sessionsList;
+CRITICAL_SECTION hashmapCriticalSection;
+unordered_set<wstring> sessionIdSet;
+LPSYNCHRONIZATION_BARRIER lpBarrier;
+queue<pair<DWORD,DWORD>> eventQueue;
+//concurrent_queue<DWORD[2]> eventQueue;
 
-//
 
 // GetIAudioSessionManager2
 // Retrieves and passes out a pointer to the IAudioSessionManager2 interface for the
@@ -134,7 +143,7 @@ HRESULT GetIAudioSessionManager2(IAudioSessionManager2 ** ppSessionManager)
 // Prints information about the session and adds it to session list
 // This method will increase the ref count to pSession if it succeeds
 // Caller should release pSession when caller is done with it
-HRESULT AddAudioSession(IAudioSessionControl2 * pSession)
+HRESULT AddAudioSession(IAudioSessionControl2 * pSession, IAudioSessionEvents * pAudioSessionEvents)
 {
   if(!pSession)
   {
@@ -146,7 +155,7 @@ HRESULT AddAudioSession(IAudioSessionControl2 * pSession)
   HRESULT hr = S_OK;
   DWORD sessionProcessId;
   LPWSTR pswDisplayName = NULL;
-  LPWSTR pswSessionID = NULL;
+  LPWSTR pswSessionId = NULL;
   LPWSTR pswSessionInstance = NULL;
   hr = pSession -> GetDisplayName(&pswDisplayName);
   if(hr != S_OK)
@@ -156,7 +165,7 @@ HRESULT AddAudioSession(IAudioSessionControl2 * pSession)
     #endif
     return hr;
   }
-  hr = pSession -> GetSessionIdentifier(&pswSessionID);
+  hr = pSession -> GetSessionIdentifier(&pswSessionId);
   if(hr != S_OK)
   {
     #if LOGGING
@@ -172,22 +181,35 @@ HRESULT AddAudioSession(IAudioSessionControl2 * pSession)
     printf("ERROR: GetSessionInstanceIdentifier failed with error code: %ld\n", hr);
     #endif
     CoTaskMemFree(pswDisplayName);
-    CoTaskMemFree(pswSessionID);
+    CoTaskMemFree(pswSessionId);
     return hr;
   }
 
-  hr = pSession -> GetProcessId(*sessionProcessId);
+  hr = pSession -> GetProcessId(&sessionProcessId);
   if(hr != S_OK && hr != AUDCLNT_S_NO_SINGLE_PROCESS)
   {
     #if LOGGING
     printf("ERROR: GetProcessId failed with error code: %ld\n", hr);
     #endif
+    CoTaskMemFree(pswDisplayName);
+    CoTaskMemFree(pswSessionId);
+    CoTaskMemFree(pswSessionInstance);
     return hr;
   }
-  printf("Audio Session found. Process: %ld, Name: %ls, Identifier: %ls, Instance: %ls\n", sessionProcessId, pswDisplayName, pswSessionID, pswSessionInstance);
+
+  printf("Audio Session found. Process: %ld, Name: %ls, Identifier: %ls, Instance: %ls\n", sessionProcessId, pswDisplayName, pswSessionId, pswSessionInstance);
+  wstring wstrFullSessionId = to_wstring(sessionProcessId) + L"!" + wstring(pswSessionId) + L"!" + wstring(pswSessionInstance);
   CoTaskMemFree(pswDisplayName);
-  CoTaskMemFree(pswSessionID);
+  CoTaskMemFree(pswSessionId);
   CoTaskMemFree(pswSessionInstance);
+
+  if(sessionIdSet.count(wstrFullSessionId))
+  {
+    printf("This session is a duplicate.");
+    return S_OK;
+  }
+
+  sessionIdSet.insert(wstrFullSessionId);
 
   if(hr == AUDCLNT_S_NO_SINGLE_PROCESS)
   {
@@ -195,10 +217,19 @@ HRESULT AddAudioSession(IAudioSessionControl2 * pSession)
     printf("This session is a cross-process audio session.\n");
   }
 
-  sessionList.insert(std::make_pair<DWORD,IAudioSessionControl2 *>(sessionProcessId,pSession));
-  pSession -> AddRef();
+  hr = pSession -> RegisterAudioSessionNotification(pAudioSessionEvents);
+  if(hr != S_OK && hr != E_POINTER)
+  {
+    #if LOGGING
+    printf("ERROR: RegisterAudioSessionNotification failed with error code %ld\n", hr);
+    #endif
+    return hr;
+  }
 
-  // TO DO - Register for session events with pSession -> RegisterAudioSessionNotification()
+  pSession -> AddRef();
+  EnterCriticalSection(&hashmapCriticalSection);
+  sessionsList.insert(make_pair(sessionProcessId, pSession));
+  LeaveCriticalSection(&hashmapCriticalSection);
 
   return hr;
 }
@@ -212,14 +243,16 @@ private:
 
     LONG m_cRefAll;
     HWND m_hwndMain;
+    IAudioSessionEvents * pAudioSessionEvents;
 
 //    ~CSessionNotifier(){};
 
 public:
 
-    CSessionNotifier(HWND hWnd): 
+    CSessionNotifier(HWND hWnd, IAudioSessionEvents * pAudioEvents): 
       m_cRefAll(1),
-      m_hwndMain (hWnd)
+      m_hwndMain (hWnd),
+      pAudioSessionEvents (pAudioEvents)
     {}
 
     // IUnknown
@@ -275,11 +308,205 @@ public:
         #endif
         return hr;
       }
-      hr = AddAudioSession(pCtrl2);
+      hr = AddAudioSession(pCtrl2,pAudioSessionEvents);
       pCtrl2 -> Release();
       return hr;
     }
 };
+
+// Callback for audio session event notification
+// Mostly copied from Microsoft Learn IAudioSessionEvents example
+//-----------------------------------------------------------
+// Client implementation of IAudioSessionEvents interface.
+// WASAPI calls these methods to notify the application when
+// a parameter or property of the audio session changes.
+//-----------------------------------------------------------
+class CAudioSessionEvents : public IAudioSessionEvents
+{
+    LONG _cRef;
+
+public:
+    CAudioSessionEvents() :
+        _cRef(1)
+    {
+    }
+
+    ~CAudioSessionEvents()
+    {
+    }
+
+    // IUnknown methods -- AddRef, Release, and QueryInterface
+
+    ULONG STDMETHODCALLTYPE AddRef()
+    {
+        return InterlockedIncrement(&_cRef);
+    }
+
+    ULONG STDMETHODCALLTYPE Release()
+    {
+        ULONG ulRef = InterlockedDecrement(&_cRef);
+        if (0 == ulRef)
+        {
+            delete this;
+        }
+        return ulRef;
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(
+                                REFIID  riid,
+                                VOID  **ppvInterface)
+    {
+        if (IID_IUnknown == riid)
+        {
+            AddRef();
+            *ppvInterface = (IUnknown*)this;
+        }
+        else if (__uuidof(IAudioSessionEvents) == riid)
+        {
+            AddRef();
+            *ppvInterface = (IAudioSessionEvents*)this;
+        }
+        else
+        {
+            *ppvInterface = NULL;
+            return E_NOINTERFACE;
+        }
+        return S_OK;
+    }
+
+    // Notification methods for audio session events
+
+    HRESULT STDMETHODCALLTYPE OnDisplayNameChanged(
+                                LPCWSTR NewDisplayName,
+                                LPCGUID EventContext)
+    {
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnIconPathChanged(
+                                LPCWSTR NewIconPath,
+                                LPCGUID EventContext)
+    {
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnSimpleVolumeChanged(
+                                float NewVolume,
+                                BOOL NewMute,
+                                LPCGUID EventContext)
+    {
+        if (NewMute)
+        {
+            printf("MUTE\n");
+        }
+        else
+        {
+            printf("Volume = %d percent\n",
+                   (UINT32)(100*NewVolume + 0.5));
+        }
+
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnChannelVolumeChanged(
+                                DWORD ChannelCount,
+                                float NewChannelVolumeArray[],
+                                DWORD ChangedChannel,
+                                LPCGUID EventContext)
+    {
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnGroupingParamChanged(
+                                LPCGUID NewGroupingParam,
+                                LPCGUID EventContext)
+    {
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnStateChanged(
+                                AudioSessionState NewState)
+    {
+        char *pszState = "?????";
+
+        switch (NewState)
+        {
+        case AudioSessionStateActive:
+            pszState = "active";
+            break;
+        case AudioSessionStateInactive:
+            pszState = "inactive";
+            break;
+        }
+        printf("New session state = %s\n", pszState);
+
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnSessionDisconnected(
+              AudioSessionDisconnectReason DisconnectReason)
+    {
+        char *pszReason = "?????";
+
+        switch (DisconnectReason)
+        {
+        case DisconnectReasonDeviceRemoval:
+            pszReason = "device removed";
+            break;
+        case DisconnectReasonServerShutdown:
+            pszReason = "server shut down";
+            break;
+        case DisconnectReasonFormatChanged:
+            pszReason = "format changed";
+            break;
+        case DisconnectReasonSessionLogoff:
+            pszReason = "user logged off";
+            break;
+        case DisconnectReasonSessionDisconnected:
+            pszReason = "session disconnected";
+            break;
+        case DisconnectReasonExclusiveModeOverride:
+            pszReason = "exclusive-mode override";
+            break;
+        }
+        printf("Audio session disconnected (reason: %s)\n",
+               pszReason);
+        
+        // Remoove this session from sessionsList hashmap and sessionIdSet
+        // Problem - OnSessionDisconnected does not give a context pointer...
+        // Do I need to add a pointer to the session to the constructor for
+        // this class, and construct a separate instance for eadh session and
+        // keep a big hashmap of each sessions full ID and assoiated instance
+        // of this class?
+        
+        return S_OK;
+    }
+};
+
+void SwitchMuteStates(DWORD oldProc, DWORD newProc)
+{
+  ISimpleAudioVolume * pVol;
+  EnterCriticalSection(&hashmapCriticalSection);
+  if(sessionsList.count(oldProc))
+  {
+    auto sessions = sessionsList.equal_range(oldProc);
+    for(auto p = sessions.first; p != sessions.second; ++p)
+    {
+      p -> second -> QueryInterface<ISimpleAudioVolume>(&pVol);
+      if(pVol) { pVol -> SetMute(true, NULL); pVol -> Release(); }
+    }
+  }
+  if(sessionsList.count(newProc))
+  {
+    auto sessions = sessionsList.equal_range(newProc);
+    for(auto p = sessions.first; p != sessions.second; ++p)
+    {
+      p -> second -> QueryInterface<ISimpleAudioVolume>(&pVol);
+      if(pVol) { pVol -> SetMute(false, NULL); pVol -> Release(); }
+    }
+  }
+  LeaveCriticalSection(&hashmapCriticalSection);
+}
 
 // Audio Session monitoring thread
 // Populates the list of all active audio sessions and registers a callbback to add
@@ -287,19 +514,12 @@ public:
 DWORD WINAPI AudioThreadRoutine(_In_ LPVOID pList)
 {
 
-  HANDLE hEvent = OpenEvent(SYNCHRONIZE | EVENT_MODIFY_STATE, false, sessionThreadEventName);
-  if(!hEvent)
-  {
-    #if LOGGING
-    printf("ERROR: Failed to open event handle.  Error code %ld.\n", GetLastError());
-    #endif
-    return (DWORD) E_FAIL;
-  }
-
   HRESULT hr = S_OK;
   IAudioSessionManager2 * pMgr = NULL;
   IAudioSessionEnumerator * pEnum = NULL;
-  CSessionNotifier sessionNotifier(NULL);
+  CAudioSessionEvents audioSessionEvents;
+  IAudioSessionEvents * pAudioEvents = &audioSessionEvents;
+  CSessionNotifier sessionNotifier(NULL, pAudioEvents);
   IAudioSessionNotification * pCallback = &sessionNotifier;
 
   // Initialize COM for this thread
@@ -342,6 +562,15 @@ DWORD WINAPI AudioThreadRoutine(_In_ LPVOID pList)
     #endif
     pMgr -> UnregisterSessionNotification(pCallback);
     pMgr -> Release();
+
+    for(auto p : sessionsList)
+    {
+      p.second -> UnregisterAudioSessionNotification(pAudioEvents);
+      p.second -> Release();
+      p.second = NULL;
+    }
+    pAudioEvents -> Release();
+
     CoUninitialize();
     return 5;
   }
@@ -356,6 +585,13 @@ DWORD WINAPI AudioThreadRoutine(_In_ LPVOID pList)
     pMgr -> UnregisterSessionNotification(pCallback);
     pEnum -> Release();
     pMgr -> Release();
+    for(auto p : sessionsList)
+    {
+      p.second -> UnregisterAudioSessionNotification(pAudioEvents);
+      p.second -> Release();
+      p.second = NULL;
+    }
+    pAudioEvents -> Release();
     CoUninitialize();
     return 6;
   }
@@ -374,7 +610,7 @@ DWORD WINAPI AudioThreadRoutine(_In_ LPVOID pList)
     pCtrl -> Release();
     if(hr != S_OK) { break; }
     
-    hr = AddAudioSession(pCtrl2);
+    hr = AddAudioSession(pCtrl2, pAudioEvents);
     pCtrl2 -> Release();
     if(hr != S_OK && hr != AUDCLNT_S_NO_SINGLE_PROCESS) { break; }
   }
@@ -385,64 +621,59 @@ DWORD WINAPI AudioThreadRoutine(_In_ LPVOID pList)
     #if LOGGING
     printf("ERROR: Problem in enumeration loop, error code: %ld\n", hr);
     #endif
-    pMgr -> UnRegisterSessionNotification(pCallback);
+    pMgr -> UnregisterSessionNotification(pCallback);
     pMgr -> Release();
+
+    for(auto p : sessionsList)
+    {
+      p.second -> UnregisterAudioSessionNotification(pAudioEvents);
+      p.second -> Release();
+      p.second = NULL;
+    }
+    pAudioEvents -> Release();
+    
     CoUninitialize();
     return 7;
   }
 
-  // Notify the main thread that we are initialized and ready to go
-  SetEvent(hEvent);
+  // Notify the main thread of successful setup and wait
+  SetEvent(ghEvents[0]);
+  EnterSynchronizationBarrier(lpBarrier, 0);
 
-  // Make sure the main thread has resumed and reset the event
-  // This is ugly and theoretically unreliable, replace with something better
-  Sleep(1000);
+  pair<DWORD,DWORD> processIds;
 
-  // All done. Go to sleep and wait for end of program
-  WaitForSingleObject(hEvent, INFINITE);
+  // Wait for work or quit event. Any non-zero return value
+  // means either the quit event has been set (array index 1) or something
+  // bizarrely wrong has happened (any other non-zero result)
+  while(!WaitForMultipleObjects(2, ghEvents, false, INFINITE))
+  {
+    while(!eventQueue.empty())
+    {
+      processIds = eventQueue.front();
+      SwitchMuteStates(processIds.first, processIds.second);
+      eventQueue.pop();
+    }
 
+  }
+
+  // End o program cleanup
   pMgr -> UnregisterSessionNotification(pCallback);
   pMgr -> Release();
 
-  for(auto p : sessionList)
+  for(auto p : sessionsList)
   {
-    // TO DO - unregister notification with p.second -> UnregisterAudioSessionNotification();
+    p.second -> UnregisterAudioSessionNotification(pAudioEvents);
     p.second -> Release();
     p.second = NULL;
   }
+  pAudioEvents -> Release();
 
   CoUninitialize();
-  CloseHandle(hEvent);
   return (DWORD) hr;
 }
 
-
-void CALLBACK MuteRoutine( ... )
-{
-  int[2] processes = (int[2]) *pv;
-  int oldProc = processes[0];
-  omt newProc = processes[1];
-  ISimpleAudioVolume* pVol;
-  if(sessionList.contains(oldproc))
-  {
-    for(auto p: sessionsList.equal_range(oldProc))
-    {
-      p.second -> QueryInterface(ISimpleAudioVolume, &pVol);
-      if(pVol) { pVol -> setMute(true); pVol -> Release(); }
-    }
-  }
-  if(sessionList.contains(newProc))
-  {
-    for(auto p: sessionsList.equal_range(newProc))
-    {
-      p.second -> QueryInterface(ISimpleAudioVolume, &pVol);
-      if(pVol) { pVol -> SetMute(false); pVol -> Release(); }
-    }
-  }
-}
-
 // Event procssing thread routine
-// Runs in a loop and receives event reports fromthe callback in the main thread
+// Runs in a loop and receives event reports from the callback in the main thread
 
 // Callback function for the WinEvent hook
 // This should be as short as possible and just gather and dispatch
@@ -472,15 +703,12 @@ void CALLBACK WinEventProc(
     DWORD switchedProcessId;
     DWORD switchedThreadId = GetWindowThreadProcessId(hwnd, &switchedProcessId);
 
-    // Original payload, remove when no longer needed
-//    PlaySound(TEXT("C:\\Windows\\Media\\Speech Misrecognition.wav"), NULL, SND_FILENAME | SND_ASYNC);
     printf("Focus change, window of process %ld thread %ld now has focus.\n", switchedProcessId, switchedThreadId);
-    if(switchedProcessId == oldProcessId) { return; }
+    if(switchedProcessId == oldProcessId) { return; }    
 
-    // TO DO - Post Thread pool timer task to run MuteRoutine(switchedProcessId, oldProcessId)
-    int[2] processes = {oldprocessId, switchedProcessId};
-
-    TrySubmitThreadpoolCallback(MuteRoutine, (void*) &processes, NULL);
+    pair<DWORD,DWORD> processIds = make_pair(oldProcessId, switchedProcessId);
+    eventQueue.push(processIds);
+    SetEvent(ghEvents[0]); // Set "work to do" event
 
     oldProcessId = switchedProcessId; // Set new process as the new "old" process for the next focus change
   }
@@ -494,20 +722,35 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
                    LPSTR lpCmdLine, int nShowCmd)
 {
 
-//  cout << "This is a test of console output." << endl;
-
   setvbuf(stdout, NULL, _IONBF, 0);
-  HANDLE hAudioThreadEvent = CreateEvent(NULL, false, false, sessionThreadEventName);
-  if(!hAudioThreadEvent)
+
+  ghEvents[0] = CreateEvent(NULL, false, false, workEventName);
+  if(!ghEvents[0])
   {
     #if LOGGING
-    printf("ERROR: Creation of synchronization event failed.\n");
+    printf("ERROR: Creation of work event failed.\n");
     #endif
     return 1;
   }
- 
-  // Start event processing thread here, once implemented
-  
+  ghEvents[1] = CreateEvent(NULL, true, false, quitEventName);
+  if(!ghEvents[1])
+  {
+    #if LOGGING
+    printf("ERROR: Creation of quit event failed.\n");
+    #endif
+    return 1;
+  }
+
+  if(!InitializeSynchronizationBarrier(lpBarrier,2,-1))
+  {
+    #if LOGGING
+    printf("ERROR: Creation of synchronization barrier failed.\n");
+    #endif
+    return 1;
+  }
+
+  InitializeCriticalSectionAndSpinCount(&hashmapCriticalSection,(DWORD) 8000);
+
   // Start audio session tracking thread
   HANDLE hAudioThread = CreateThread(NULL, 0, AudioThreadRoutine, NULL, 0, NULL);
   if(!hAudioThread)
@@ -515,19 +758,26 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
     #if LOGGING
     printf("ERROR: Failed to start audio session tracking thread.\n");
     #endif
+    DeleteCriticalSection(&hashmapCriticalSection);
     return 2;
   }
+  
+  // Wait for other threads to finish setup.
+  // Wait for the thread itself as well as the ready event, in case the thread aborts
+  HANDLE hAudioThreadState[2] = {ghEvents[0], hAudioThread};
 
-  // Wait for other threads to finish setup. Mostly for debug purposes
-  HANDLE hAudioThreadState[2] = {hAudioThreadEvent, hAudioThread};
   DWORD result = WaitForMultipleObjects(2, hAudioThreadState, false, 20000);
   if(result != WAIT_OBJECT_0)
   {
     #if LOGGING
     printf("ERROR: Failure or timeout in audio thread, return code: %ld\n", result);
     #endif
+    DeleteCriticalSection(&hashmapCriticalSection);
     return 3;
   }
+
+  EnterSynchronizationBarrier(lpBarrier, 0);
+  DeleteSynchronizationBarrier(lpBarrier);
 
   // Set the event hook for the callback function
   HWINEVENTHOOK hWinEventHook = SetWinEventHook(
@@ -539,8 +789,6 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
   // Message loop, runs continuously until WM_QUIT or something goes wrong
   // GetMessage returns a "true" value normally, or a "0" on a WM_QUIT message...
   // ...or a "-1" (say WHAT, now?!) if some kind of error happens.
-  // NOTE: Safer version which doesn't derail if GetMessage returns -1.
-  // Doesn't attempt any special error handling, just aborts and cleans up.
   MSG msg;
   int b;
   while ((b = GetMessage(&msg, NULL, 0, 0)) && b != -1) {
@@ -549,8 +797,10 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE hinstPrev,
   }
 
   if (hWinEventHook) UnhookWinEvent(hWinEventHook);
-  SetEvent(hAudioThreadEvent);
+  SetEvent(ghEvents[1]); // Set the quit event
+  WaitForSingleObject(hAudioThread, INFINITE);
 
-  // End event procesing thread
+  DeleteCriticalSection(&hashmapCriticalSection);
+
   return 0;
 }
